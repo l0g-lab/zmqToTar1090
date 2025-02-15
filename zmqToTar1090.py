@@ -321,34 +321,7 @@ class DroneManager:
         except Exception as e:
             logger.error(f"Error writing JSON: {e}")
 
-def process_drone_info(drone_info, drone_manager, max_age: float):
-    if 'mac' in drone_info and drone_info['mac'] and is_valid_latlon(drone_info['lat'], drone_info['lon']):
-        # Add the 'time' field in ISO8601 format
-        drone_info['time'] = iso_timestamp_now()
-
-        main_drone_id = drone_manager.update_or_add_main_drone(drone_info)
-
-        if main_drone_id:
-            main_lat = drone_info.get('lat', 0.0)
-            main_lon = drone_info.get('lon', 0.0)
-
-            pilot_lat = drone_info.get('pilot_lat', 0.0)
-            pilot_lon = drone_info.get('pilot_lon', 0.0)
-
-            if not is_valid_latlon(main_lat, main_lon):
-                logger.info(f"Skipping drone {drone_info.get('id')} - invalid lat/lon: ({main_lat}, {main_lon})")
-                drone_manager.update_or_add_pilot_drone(main_drone_id, {'pilot_lat': 0.0, 'pilot_lon': 0.0, 'time': drone_info['time']})
-                return
-
-            drone_manager.update_or_add_pilot_drone(main_drone_id, drone_info)
-
-    else:
-        logger.warning("No 'id' or valid lat/lon found in message. Skipping...")
-
-    drone_manager.remove_old_drones(max_age)
-
-
-def parse_bluetooth_type(message_list: list) -> dict:
+def parse_list_format(message_list: list) -> dict:
     """ This function parses bluetooth formatted drone data (array of dicts) """
     drone_info = {}
     drone_info['mac'] = None
@@ -411,7 +384,7 @@ def parse_bluetooth_type(message_list: list) -> dict:
 
     return drone_info
 
-def parse_esp32_type(message: dict) -> dict:
+def parse_esp32_dict(message: dict) -> dict:
     """ Parses ESP32 formatted drone data (single dict) """
     drone_info = {}
     descriptions = set()
@@ -479,19 +452,6 @@ def parse_esp32_type(message: dict) -> dict:
 
     return drone_info
 
-def parse_message_type(message):
-    try:
-        if isinstance(message, list):
-            return parse_bluetooth_type(message)
-        if isinstance(message, dict):
-            return parse_esp32_type(message)
-        else:
-            logger.error("Unknown ZMQ payload type - not BT or ESP32. Skipping")
-            return None
-    except Exception as e:
-        logger.error(f"Error parsing incoming messages: {e}")
-        return None
-
 def zmq_to_json(file, max_age: float, max_drones: int, pub_port: int):
     """ This function processes ZMQ data, and writes it to the JSON file """
     # SUB to internal ZMQ
@@ -508,16 +468,49 @@ def zmq_to_json(file, max_age: float, max_drones: int, pub_port: int):
         logger.debug(f"Processing ZMQ message for JSON file")
 
         # Decide which parser to use - can add wifi type here later
-        drone_info = parse_message_type(message)
-
-        if not drone_info:
+        try:
+            if isinstance(message, list):
+                drone_info = parse_list_format(message)
+            elif isinstance(message, dict):
+                drone_info = parse_esp32_dict(message)
+            else:
+                logger.error("Unknown ZMQ payload type - not list(bluetooth) or dict(esp32). Skipping.")
+                continue
+        except Exception as e:
+            logger.error(f"Error parsing incoming messages: {e}")
             continue
 
-        # Process Drone Information - removes stale drones, creates pilots, etc
-        process_drone_info(drone_info, drone_manager, max_age)
+        if 'mac' in drone_info and drone_info['mac'] and is_valid_latlon(drone_info['lat'], drone_info['lon']):
+            # Always add a 'time' field in ISO8601 for tar1090 ingestion
+            drone_info['time'] = iso_timestamp_now()
+
+            main_drone_id = drone_manager.update_or_add_main_drone(drone_info)
+
+            if main_drone_id:
+                # Grab the main drone coords
+                main_lat = drone_info.get('lat', 0.0)
+                main_lon = drone_info.get('lon', 0.0)
+
+                # Grab the pilot coords
+                pilot_lat = drone_info.get('pilot_lat', 0.0)
+                pilot_lon = drone_info.get('pilot_lon', 0.0)
+
+                # If main drone lat/lon is invalid, skip adding the drone
+                if not is_valid_latlon(main_lat, main_lon):
+                    logger.info(f"Skipping drone {drone_info.get('id')} - invalid lat/lon: ({main_lat}, {main_lon})")
+                    drone_manager.update_or_add_pilot_drone(main_drone_id, {'pilot_lat': 0.0, 'pilot_lon': 0.0, 'time': drone_info['time']})
+                    continue
+
+                drone_manager.update_or_add_pilot_drone(main_drone_id, drone_info)
+
+        else:
+            logger.warning("No 'id' or valid lat/lon found in message. Skipping...")
 
         # After updating, write JSON
         drone_manager.send_updates(file)
+
+        # Remove any drones that haven't been updated for >10s
+        drone_manager.remove_old_drones(max_age)
 
 def zmq_to_sbs(max_age: float, max_drones: int, pub_port: int, sbs_setting: str):
     """
@@ -526,6 +519,11 @@ def zmq_to_sbs(max_age: float, max_drones: int, pub_port: int, sbs_setting: str)
     Format : MSG,3,1,1,icaoHex,1,messageDate,messageTime,currentDate,currentTime,callsign_8char,altitude_ft,groundspeed_kts,track,lat,lon,vert_rate_fpm,squawk,squawkChangeAlert,squawkEmergencyFlag,squawkIdentFlag,groundFlag_0airborne_-1ground
     Sample : MSG,3,1,1,4AC8B3,1,2019/12/10,19:10:46.320,2019/12/10,19:10:47.789,,36017,,,51.1001,10.1915,,,,,,
     """
+
+    drone_iso_time = iso_timestamp_now()
+    dt = datetime.datetime.fromisoformat(drone_iso_time.rstrip('Z'))
+    date_str = dt.date().strftime('%Y/%m/%d')
+    time_str = dt.time().strftime('%H:%M:%S.%f')[:-3]
 
     def generate_sbs_string(drone_info: dict) -> str:
         sbs_message = f"MSG,3,1,1," # MSG Type, TX Type, Session ID, Aircraft ID
@@ -569,30 +567,106 @@ def zmq_to_sbs(max_age: float, max_drones: int, pub_port: int, sbs_setting: str)
                     message = zmq_socket.recv_json()
                     logger.debug(f"Processing ZMQ message for SBS.")
 
-                    # Set timestamp for SBS data
-                    drone_iso_time = iso_timestamp_now()
-                    dt = datetime.datetime.fromisoformat(drone_iso_time.rstrip('Z'))
-                    date_str = dt.date().strftime('%Y/%m/%d')
-                    time_str = dt.time().strftime('%H:%M:%S.%f')[:-3]
-
                     # Decide which parser to use - can add wifi type here later
-                    drone_info = parse_message_type(message)
-
-                    if not drone_info:
+                    try:
+                        if isinstance(message, list):
+                            drone_info = parse_list_format(message)
+                        elif isinstance(message, dict):
+                            drone_info = parse_esp32_dict(message)
+                        else:
+                            logger.error("Unknown ZMQ payload type - not list(bluetooth) or dict(esp32). Skipping.")
+                            continue
+                    except Exception as e:
+                        logger.error(f"Error parsing incoming messages: {e}")
                         continue
 
-                    # Process Drone Information - removes stale drones, creates pilots, etc
-                    process_drone_info(drone_info, drone_manager, max_age)
+                    ####### Adding in the code from zmq_to_json so we can make sure we are setting up drones correctly #######
+                    if 'id' in drone_info:
+                        # Always add a 'time' field in ISO8601 for tar1090 ingestion
+                        #drone_iso_time = iso_timestamp_now()
 
-                    for mac, drone_id in drone_manager.drones:
+                        # If we have a MAC, set last 6 characters to the icaoHex field
+                        #mac = message[0]['Basic ID'].get('MAC').replace(":","")[-6:]
+                        #print(f"MAC: {mac}")
+
+                        # If we have an ID, prefix with 'drone-' if needed
+                        if not drone_info['id'].startswith('drone-'):
+                            drone_info['id'] = f"drone-{drone_info['id']}"
+
+                        # Grab the main drone coords
+                        main_lat = drone_info.get('lat', 0.0)
+                        main_lon = drone_info.get('lon', 0.0)
+
+                        # Grab the pilot coords
+                        pilot_lat = drone_info.get('pilot_lat', 0.0)
+                        pilot_lon = drone_info.get('pilot_lon', 0.0)
+
+                        # If main drone lat/lon is invalid, skip adding the drone
+                        if not is_valid_latlon(main_lat, main_lon):
+                            logger.warning(f"Skipping drone {drone_info['id']} - invalid lat/lon: ({main_lat}, {main_lon})")
+                            pilot_id = drone_info['id'].replace("drone-", "pilot-")
+                            if pilot_id in drone_manager.drone_dict:
+                                logger.debug(f"Removing stale pilot entry for invalid drone: {pilot_id}")
+                                if pilot_id in drone_manager.drones:
+                                    drone_manager.drones.remove(pilot_id)
+                                del drone_manager.drone_dict[pilot_id]
+                            continue
+
+                        # 1) Create or update the main Drone object
+                        main_drone = Drone(
+                            id=drone_info['id'],
+                            lat=main_lat,
+                            lon=main_lon,
+                            speed=drone_info.get('speed', 0.0),
+                            vspeed=drone_info.get('vspeed', 0.0),
+                            alt=drone_info.get('alt', 0.0),
+                            height=drone_info.get('height', 0.0),
+                            pilot_lat=pilot_lat,
+                            pilot_lon=pilot_lon,
+                            description=drone_info.get('description', ""),
+                            time_str=drone_iso_time
+                        )
+                        drone_manager.update_or_add_drone(main_drone.id, main_drone)
+
+                        # 2) If pilot lat/long is valid, create second "pilot" object
+                        if is_valid_latlon(pilot_lat, pilot_lon):
+                            pilot_id = main_drone.id.replace("drone-", "pilot-")
+                            pilot_drone = Drone(
+                                id=pilot_id,
+                                lat=pilot_lat,
+                                lon=pilot_lon,
+                                speed=0.0,
+                                vspeed=0.0,
+                                alt=0.0,
+                                height=0.0,
+                                pilot_lat=0.0,
+                                pilot_lon=0.0,
+                                description=main_drone.description,
+                                time=drone_iso_time
+                            )
+                            drone_manager.update_or_add_drone(pilot_id, pilot_drone)
+
+                        else:
+                            # if pilot lat/lon is invalid or zero, remove leftover pilot
+                            pilot_id = main_drone.id.replace("drone-", "pilot-")
+                            if pilot_id in drone_manager.drone_dict:
+                                logger.debug(f"Removing stale pilot entry {pilot_id} (invalid or no pilot coords)")
+                                if pilot_id in drone_manager.drones:
+                                    drone_manager.drones.remove(pilot_id)
+                                del drone_manager.drone_dict[pilot_id]
+
+                    else:
+                        logger.warning("No 'id' found in message. Skipping...")
+
+                    for drone_id in drone_manager.drones:
                         drone_list = drone_manager.drone_dict[drone_id].to_dict()
-                        drone_list['id'] = mac.replace(":","")[-6:].upper()
                         drone_sbs_message = generate_sbs_string(drone_list)
                         sbs_socket.sendall(drone_sbs_message.encode())
                         logger.debug(f"Sent SBS message: {drone_sbs_message}")
+                    ####### Adding in the code from zmq_to_json so we can make sure we are setting up drones correctly #######
 
         except (ConnectionRefusedError, socket.error) as e:
-            logging.error(f"Connection error to {sbs_setting}: {e}. Retrying in 5 seconds...")
+            logging.error(f"Connection error: {e}. Retrying in 5 seconds...")
             time.sleep(5)
             continue
         sbs_socket.close()
@@ -605,7 +679,7 @@ def main():
     parser.add_argument("--zmqjson", help="Enable ZMQ to JSON", action="store_true")
     parser.add_argument("--json-file", default="/run/readsb/drone.json", help="JSON file to write parsed data to. (default=/run/readsb/drone.json)")
     parser.add_argument("--zmqsbs", help="Enable ZMQ to SBS", action="store_true")
-    parser.add_argument("--sbssetting", default="127.0.0.1:32006", help="Define SBS server to connect to (default=127.0.0.1:30003)")
+    parser.add_argument("--sbssetting", default="127.0.0.1:30003", help="Define SBS server to connect to (default=127.0.0.1:30003)")
     parser.add_argument("--max-age", default=10, help="Number of seconds before drone is old and removing from JSON file (default=10)", type=float) # not yet added
     parser.add_argument("--max-drones", default=30, help="Number of drones to filter for. (default=30)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
